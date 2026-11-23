@@ -20,6 +20,8 @@ jobs:
           toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: rustfmt check (query crate)
         if: ${{ !cancelled() }}
         run: cargo fmt -p query -- --check
