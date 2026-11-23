@@ -1,0 +1,31 @@
+name: verify-10573
+
+on:
+  push:
+    branches:
+      - fix/promql-match-all-grouped
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  planner-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt check (query crate)
+        if: ${{ !cancelled() }}
+        run: cargo fmt -p query -- --check
+      - name: planner matcher tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p query --lib test_matchers_to_expr -- --nocapture
+      - name: clippy (query crate, lib + tests)
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p query --lib --tests -- -D warnings
