@@ -12,18 +12,24 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use api::v1::Rows;
+use api::v1::{Rows, SemanticType};
 use bytes::Bytes;
 use common_base::Plugins;
 use common_recordbatch::RecordBatches;
 use common_time::Timestamp;
 use common_time::timestamp::TimeUnit;
+use datatypes::prelude::ConcreteDataType;
+use datatypes::schema::ColumnSchema;
 use parquet::file::metadata::ParquetMetaData;
+use store_api::codec::PrimaryKeyEncoding;
+use store_api::metadata::ColumnMetadata;
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::{RegionRequest, RegionTruncateRequest};
+use store_api::region_request::{
+    AddColumn, AlterKind, RegionAlterRequest, RegionRequest, RegionTruncateRequest,
+};
 use store_api::storage::{FileId, RegionId};
 
-use super::{PublicationOutcome, TableCompactionSnapshot};
+use super::{PublicationOutcome, TableCompactionSnapshot, is_table_compaction_metadata_compatible};
 use crate::config::MitoConfig;
 use crate::engine::MitoEngine;
 use crate::engine::region_hook::{RegionHook, RegionHookRef, VerifiedSstFileInfo};
@@ -83,18 +89,65 @@ async fn seed_shared_inputs(
     region_id: RegionId,
     row_ranges: &[(usize, usize)],
 ) -> (TableCompactionSnapshot, Vec<FileMeta>) {
-    let create = CreateRequestBuilder::new().build();
+    seed_shared_inputs_with_encoding(engine, region_id, row_ranges, "dense").await
+}
+
+async fn seed_shared_inputs_with_encoding(
+    engine: &MitoEngine,
+    region_id: RegionId,
+    row_ranges: &[(usize, usize)],
+    encoding: &str,
+) -> (TableCompactionSnapshot, Vec<FileMeta>) {
+    let mut create = CreateRequestBuilder::new()
+        .insert_option("primary_key_encoding", encoding)
+        .build();
+    if encoding == "sparse" {
+        use store_api::storage::consts::ReservedColumnId;
+        for (name, column_id, data_type) in [
+            (
+                "__table_id",
+                ReservedColumnId::table_id(),
+                ConcreteDataType::uint32_datatype(),
+            ),
+            (
+                "__tsid",
+                ReservedColumnId::tsid(),
+                ConcreteDataType::uint64_datatype(),
+            ),
+        ] {
+            create.column_metadatas.push(ColumnMetadata {
+                column_schema: ColumnSchema::new(name, data_type, false),
+                semantic_type: SemanticType::Tag,
+                column_id,
+            });
+        }
+        create.primary_key.splice(
+            0..0,
+            [ReservedColumnId::table_id(), ReservedColumnId::tsid()],
+        );
+    }
     engine
         .handle_request(region_id, RegionRequest::Create(create.clone()))
         .await
         .unwrap();
     for &(start, end) in row_ranges {
+        let mut rows = build_rows(start, end);
+        if encoding == "sparse" {
+            for (index, row) in rows.iter_mut().enumerate() {
+                row.values.push(api::v1::Value {
+                    value_data: Some(api::v1::value::ValueData::U32Value(1)),
+                });
+                row.values.push(api::v1::Value {
+                    value_data: Some(api::v1::value::ValueData::U64Value((start + index) as u64)),
+                });
+            }
+        }
         put_rows(
             engine,
             region_id,
             Rows {
                 schema: rows_schema(&create),
-                rows: build_rows(start, end),
+                rows,
             },
         )
         .await;
@@ -1092,4 +1145,195 @@ async fn test_failed_verification_does_not_notify_hook() {
         engine.table_compaction_snapshot(region_id).unwrap().inputs
     );
     assert_eq!(6, row_count(&engine, region_id).await);
+}
+
+#[tokio::test]
+async fn test_shared_ingest_snapshot_during_manifest_work() {
+    use crate::region::RegionLeaderState;
+    use store_api::region_engine::RegionRole;
+
+    let mut env = TestEnv::new().await;
+    let engine = env.create_engine(config()).await;
+    let region_id = RegionId::new(1, 1);
+    let (snapshot, _) = seed_shared_inputs(&engine, region_id, &[(0, 3), (3, 6)]).await;
+    let region = engine.get_region(region_id).unwrap();
+    let selected = &snapshot.inputs[0];
+    for state in [RegionLeaderState::Editing, RegionLeaderState::Altering] {
+        match state {
+            RegionLeaderState::Editing => region.set_editing(RegionLeaderState::Writable).unwrap(),
+            RegionLeaderState::Altering => region.set_altering().unwrap(),
+            _ => unreachable!(),
+        }
+        let planning = engine.table_compaction_snapshot(region_id).unwrap();
+        assert_eq!(snapshot.metadata, planning.metadata);
+        assert_eq!(snapshot.options, planning.options);
+        assert_eq!(snapshot.inputs, planning.inputs);
+        let options = engine.shared_ingest_snapshot(region_id, &[]).unwrap();
+        assert_eq!(snapshot.options, options.options);
+        assert!(options.inputs.is_empty());
+        let admission = engine
+            .shared_ingest_snapshot(region_id, &[selected.file_id, FileId::random()])
+            .unwrap();
+        assert_eq!(vec![selected.clone()], admission.inputs);
+        region.switch_state_to_writable(state);
+    }
+    region.set_role(RegionRole::Follower);
+    assert!(engine.table_compaction_snapshot(region_id).is_err());
+    assert!(engine.shared_ingest_snapshot(region_id, &[]).is_err());
+    region.set_role(RegionRole::Leader);
+    region.set_entering_staging().unwrap();
+    assert!(engine.table_compaction_snapshot(region_id).is_err());
+    assert!(engine.shared_ingest_snapshot(region_id, &[]).is_err());
+}
+
+#[tokio::test]
+async fn test_shared_ingest_queues_behind_table_publication() {
+    let hook = Arc::new(PublicationBarrier {
+        after_commit: false,
+        armed: AtomicBool::new(false),
+        entered: Default::default(),
+        resume: Default::default(),
+    });
+    let plugins = Plugins::new();
+    plugins.insert(hook.clone() as RegionHookRef);
+    let mut env = TestEnv::new().await;
+    let engine = env.create_engine_with_plugins(config(), plugins).await;
+    let region_id = RegionId::new(1, 1);
+    let (snapshot, output) = seed(&engine, region_id).await;
+    let region = engine.get_region(region_id).unwrap();
+    let mut incoming = copy_sst(&region, &output, LEVEL_SHARED).await;
+    incoming.sequence = None;
+    hook.armed.store(true, Ordering::SeqCst);
+    let (publication, admission) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                engine.publish_table_compaction(region_id, snapshot, vec![output]),
+                async {
+                    hook.entered.notified().await;
+                    // Admission checks can read committed options while the worker is Editing.
+                    engine.shared_ingest_snapshot(region_id, &[]).unwrap();
+                    let edit = engine.edit_region(
+                        region_id,
+                        RegionEdit {
+                            files_to_add: vec![incoming.clone()],
+                            ..Default::default()
+                        },
+                    );
+                    tokio::pin!(edit);
+                    assert!(futures::poll!(&mut edit).is_pending());
+                    hook.resume.notify_one();
+                    edit.await
+                }
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(PublicationOutcome::Applied, publication.unwrap());
+    admission.unwrap();
+    let installed = engine
+        .shared_ingest_snapshot(region_id, &[incoming.file_id])
+        .unwrap();
+    assert_eq!(1, installed.inputs.len());
+    assert!(installed.inputs[0].sequence.is_some());
+    assert_eq!(3, row_count(&engine, region_id).await);
+}
+
+/// A captured output remains publishable after a nullable sparse tag is added.
+/// The final manifest fence and query compatibility are exercised together.
+#[tokio::test]
+async fn test_table_compaction_publication_after_nullable_tag_added() {
+    let mut env = TestEnv::new().await;
+    let engine = env.create_engine(config()).await;
+    let region_id = RegionId::new(1, 1);
+    let (snapshot, outputs) =
+        seed_shared_inputs_with_encoding(&engine, region_id, &[(0, 3)], "sparse").await;
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Alter(RegionAlterRequest {
+                kind: AlterKind::AddColumns {
+                    columns: vec![AddColumn {
+                        column_metadata: ColumnMetadata {
+                            column_schema: ColumnSchema::new(
+                                "new_tag",
+                                ConcreteDataType::string_datatype(),
+                                true,
+                            ),
+                            semantic_type: SemanticType::Tag,
+                            column_id: 3,
+                        },
+                        location: None,
+                    }],
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let current = engine.table_compaction_snapshot(region_id).unwrap();
+    assert!(is_table_compaction_metadata_compatible(
+        &snapshot.metadata,
+        &current.metadata
+    ));
+    assert!(!is_table_compaction_metadata_compatible(
+        &current.metadata,
+        &snapshot.metadata
+    ));
+    // Changes to existing columns, encoding, routing or the key order remain fenced.
+    for change in [
+        "column",
+        "encoding",
+        "partition",
+        "key",
+        "required",
+        "version_only",
+    ] {
+        let mut incompatible = (*current.metadata).clone();
+        match change {
+            "column" => incompatible.column_metadatas[0].column_schema.name = "renamed".into(),
+            "encoding" => incompatible.primary_key_encoding = PrimaryKeyEncoding::Dense,
+            "partition" => incompatible.set_partition_expr(Some("changed".into())),
+            "key" => incompatible.primary_key.reverse(),
+            "required" => {
+                incompatible
+                    .column_metadatas
+                    .last_mut()
+                    .unwrap()
+                    .column_schema =
+                    ColumnSchema::new("new_tag", ConcreteDataType::string_datatype(), false)
+            }
+            "version_only" => {
+                incompatible = (*snapshot.metadata).clone();
+                incompatible.schema_version += 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !is_table_compaction_metadata_compatible(&snapshot.metadata, &incompatible),
+            "{change}"
+        );
+    }
+    assert_eq!(
+        PublicationOutcome::Applied,
+        engine
+            .publish_table_compaction(region_id, snapshot, outputs)
+            .await
+            .unwrap()
+    );
+    let batches = RecordBatches::try_collect(
+        engine
+            .scan_to_stream(region_id, Default::default())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        3,
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>()
+    );
+    for batch in batches.iter() {
+        let tag = batch.column_by_name("new_tag").unwrap();
+        assert_eq!(tag.len(), tag.null_count());
+    }
+    engine.stop().await.unwrap();
 }

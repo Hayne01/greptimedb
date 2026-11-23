@@ -15,10 +15,12 @@ pub(crate) mod output;
 #[cfg(test)]
 mod tests;
 
+use api::v1::SemanticType;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
-use store_api::metadata::RegionMetadataRef;
-use store_api::storage::RegionId;
+use store_api::codec::PrimaryKeyEncoding;
+use store_api::metadata::{RegionMetadata, RegionMetadataRef};
+use store_api::storage::{FileId, RegionId};
 use tokio::sync::oneshot;
 
 use crate::engine::MitoEngine;
@@ -55,7 +57,51 @@ pub enum PublicationOutcome {
     StaleInputs,
 }
 
+/// Whether outputs built under `captured` remain valid after a schema change.
+///
+/// Sparse keys identify tags by column ID, so adding nullable tags without defaults
+/// leaves captured rows unchanged. Existing column definitions, key order, routing,
+/// and encoding must remain unchanged. This is directional; it does not authorize
+/// rebuilding a plan or changing its captured output metadata.
+pub fn is_table_compaction_metadata_compatible(
+    captured: &RegionMetadata,
+    current: &RegionMetadata,
+) -> bool {
+    if captured == current {
+        return true;
+    }
+    if captured.region_id != current.region_id
+        || captured.primary_key_encoding != PrimaryKeyEncoding::Sparse
+        || current.primary_key_encoding != captured.primary_key_encoding
+        || captured.partition_expr != current.partition_expr
+        || captured.partition_expr_version != current.partition_expr_version
+        || current.schema_version <= captured.schema_version
+        || current.column_metadatas.len() <= captured.column_metadatas.len()
+        || !current.primary_key.starts_with(&captured.primary_key)
+    {
+        return false;
+    }
+    if !captured
+        .column_metadatas
+        .iter()
+        .all(|column| current.column_by_id(column.column_id) == Some(column))
+    {
+        return false;
+    }
+    let added = current.column_metadatas.len() - captured.column_metadatas.len();
+    current.primary_key.len() == captured.primary_key.len() + added
+        && current.column_metadatas.iter().all(|column| {
+            captured.column_by_id(column.column_id).is_some()
+                || (column.semantic_type == SemanticType::Tag
+                    && column.column_schema.is_nullable()
+                    && column.column_schema.default_constraint().is_none()
+                    && current.primary_key_index(column.column_id).is_some())
+        })
+}
+
 impl MitoEngine {
+    /// Reads a committed version without waiting for manifest work to become idle.
+    /// Publication revalidates the selected inputs, metadata and options in the worker.
     pub fn table_compaction_snapshot(
         &self,
         region_id: RegionId,
@@ -64,7 +110,14 @@ impl MitoEngine {
             .find_region(region_id)
             .context(RegionNotFoundSnafu { region_id })?;
         ensure!(
-            region.state() == RegionRoleState::Leader(RegionLeaderState::Writable),
+            matches!(
+                region.state(),
+                RegionRoleState::Leader(
+                    RegionLeaderState::Writable
+                        | RegionLeaderState::Editing
+                        | RegionLeaderState::Altering
+                )
+            ) && !region.in_staging_session(),
             RegionBusySnafu { region_id }
         );
         let current = region.version_control.current();
@@ -73,6 +126,44 @@ impl MitoEngine {
             options: serde_json::to_value(&current.version.options).context(SerdeJsonSnafu)?,
             inputs: current.version.ssts.levels()[SHARED_LEVEL_SLOT]
                 .files()
+                .map(|file| file.meta_ref().clone())
+                .collect(),
+        })
+    }
+
+    /// Reads committed shared inputs for admission checks, without requiring an idle worker.
+    ///
+    /// An empty selection reads only metadata and options. Lookups are bounded by the requested
+    /// file ids, not the region's file count. Editing/Altering leave the committed version readable;
+    /// actual admission still goes through the worker queue and its lifecycle checks.
+    /// This is not a compaction planning snapshot or a reservation of the selected inputs.
+    pub fn shared_ingest_snapshot(
+        &self,
+        region_id: RegionId,
+        file_ids: &[FileId],
+    ) -> Result<TableCompactionSnapshot> {
+        let region = self
+            .find_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })?;
+        ensure!(
+            matches!(
+                region.state(),
+                RegionRoleState::Leader(
+                    RegionLeaderState::Writable
+                        | RegionLeaderState::Editing
+                        | RegionLeaderState::Altering
+                )
+            ) && !region.in_staging_session(),
+            RegionBusySnafu { region_id }
+        );
+        let current = region.version_control.current();
+        let shared = &current.version.ssts.levels()[SHARED_LEVEL_SLOT];
+        Ok(TableCompactionSnapshot {
+            metadata: current.version.metadata.clone(),
+            options: serde_json::to_value(&current.version.options).context(SerdeJsonSnafu)?,
+            inputs: file_ids
+                .iter()
+                .filter_map(|id| shared.files.get(id))
                 .map(|file| file.meta_ref().clone())
                 .collect(),
         })

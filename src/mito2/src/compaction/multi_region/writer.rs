@@ -14,14 +14,13 @@ use std::sync::Arc;
 
 use common_base::readable_size::ReadableSize;
 use partition::expr::PartitionExpr;
-use snafu::{ResultExt, ensure};
-use store_api::codec::PrimaryKeyEncoding;
+use snafu::ensure;
 use tokio_util::sync::CancellationToken;
 
 use crate::access_layer::{Metrics, OperationType, SstWriteRequest, WriteType};
 use crate::compaction::multi_region::memory::{self, MemoryLimits};
 use crate::compaction::multi_region::{MultiRegionCompactionContext, MultiRegionTarget};
-use crate::error::{ComputeArrowSnafu, Result};
+use crate::error::Result;
 use crate::read::FlatSource;
 use crate::sst::FormatType;
 use crate::sst::file::FileMeta;
@@ -72,6 +71,7 @@ impl<'a> TargetWriter<'a> {
             !self.context.cancellation.is_cancelled(),
             crate::error::CompactionCancelledSnafu
         );
+        let _stage = crate::compaction::multi_region::metrics::StageGuard::start("write_total");
         let request = self.request(source)?;
         let mut metrics = Metrics::new(WriteType::Compaction);
         let infos = self
@@ -88,6 +88,14 @@ impl<'a> TargetWriter<'a> {
                 },
             )
             .await?;
+        for (stage, elapsed) in [
+            ("encode_write_batch", metrics.write_batch),
+            ("update_index", metrics.update_index),
+            ("upload_parquet", metrics.upload_parquet),
+            ("upload_puffin", metrics.upload_puffin),
+        ] {
+            crate::compaction::multi_region::metrics::observe_stage(stage, elapsed);
+        }
         metrics.observe();
         let expression =
             crate::region::parse_partition_expr(self.target.metadata.partition_expr.as_deref())?;
@@ -104,7 +112,7 @@ impl<'a> TargetWriter<'a> {
     fn request(&self, source: FlatSource) -> Result<SstWriteRequest> {
         let config = &self.context.config;
         // The shared source plan already applies the admitted index thresholds.
-        let source = output_projection(self.target, source, self.context.cancellation.clone())?;
+        let source = cancellable_source(source, self.context.cancellation.clone());
         let index_build_inputs = Some(IndexBuildInputs {
             output_rows: None,
             plan: self.index_plan.clone(),
@@ -150,7 +158,7 @@ impl<'a> TargetWriter<'a> {
                 .min(memory::MAX_ROW_GROUP_SIZE),
             float_field_encoding: self.target.options.float_field_encoding,
             // Every resident encoder and its finish workspace are admitted together.
-            encode_parallelism: 1,
+            encode_parallelism: crate::compaction::multi_region::tuning().encode_parallelism,
             encode_runtime: EncodeRuntime::Compact,
         }
     }
@@ -207,38 +215,14 @@ impl<'a> TargetWriter<'a> {
     }
 }
 
-fn output_projection(
-    target: &MultiRegionTarget,
-    mut source: FlatSource,
-    cancellation: CancellationToken,
-) -> Result<FlatSource> {
-    let projection: Vec<_> = source
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| {
-            target.metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse
-                || !target.metadata.primary_key.iter().any(|id| {
-                    target
-                        .metadata
-                        .column_by_id(*id)
-                        .is_some_and(|column| column.column_schema.name == *field.name())
-                })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    let schema = Arc::new(
-        source
-            .schema()
-            .project(&projection)
-            .context(ComputeArrowSnafu)?,
-    );
+/// The shared merge already emits the SST layout, including encoded sparse tags.
+fn cancellable_source(mut source: FlatSource, cancellation: CancellationToken) -> FlatSource {
+    let schema = source.schema().clone();
     let stream = async_stream::try_stream! {
         while let Some(batch) = source.next_batch().await? {
             if cancellation.is_cancelled() { Err(crate::error::CompactionCancelledSnafu.build())?; }
-            yield batch.project(&projection).context(ComputeArrowSnafu)?;
+            yield batch;
         }
     };
-    Ok(FlatSource::new_stream(schema, Box::pin(stream)))
+    FlatSource::new_stream(schema, Box::pin(stream))
 }

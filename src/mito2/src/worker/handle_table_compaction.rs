@@ -15,7 +15,9 @@ use std::collections::HashSet;
 
 use snafu::ensure;
 
-use crate::engine::table_compaction::{PublicationContext, output};
+use crate::engine::table_compaction::{
+    PublicationContext, is_table_compaction_metadata_compatible, output,
+};
 use crate::error::{InvalidRequestSnafu, RegionBusySnafu, Result, StaleCompactionExecutionSnafu};
 use crate::manifest::action::{RegionEdit, RegionManifest, RegionMetaAction, RegionMetaActionList};
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionRoleState};
@@ -87,7 +89,7 @@ fn is_current(
     manifest: &RegionManifest,
 ) -> bool {
     let current = region.version_control.current();
-    context.metadata == manifest.metadata
+    is_table_compaction_metadata_compatible(&context.metadata, &manifest.metadata)
         && context.options == current.version.options
         && !edit.files_to_remove.is_empty()
         && edit

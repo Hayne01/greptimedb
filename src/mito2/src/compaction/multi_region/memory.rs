@@ -26,7 +26,8 @@ use crate::config::{FulltextIndexConfig, MitoConfig};
 use crate::error::{IndexOptionsSnafu, MultiRegionCompactionResourceSnafu, Result};
 use crate::sst::parquet::writer::SstWriteLimits;
 
-pub(crate) const BATCH_SIZE: usize = 64;
+/// Conservative byte-buffer scaling, independent of the configured batch row count.
+const BUFFER_BUDGET_FACTOR: usize = 64;
 /// Cap on the rows of one output row group.
 ///
 /// Every resident target admits an encoder sized by this count, while readers
@@ -41,6 +42,8 @@ pub(crate) const MAX_ROW_GROUP_SIZE: usize = 1024;
 #[derive(Clone)]
 pub(crate) struct MemoryLimits {
     pub(crate) batch: usize,
+    pub(crate) batch_rows: usize,
+    pub(crate) source_parallelism: usize,
     pub(crate) group: usize,
     pub(crate) index: usize,
     /// Reuses index allocation only when the optional working set fits admission.
@@ -56,10 +59,13 @@ impl MemoryLimits {
             .convert(&schema)
             .context(crate::error::WriteParquetSnafu)?
             .num_columns();
-        let batch =
-            plan.memory_limit / (64 * (plan.sources.len() + plan.targets.len() + BATCH_SIZE + 4));
+        let batch_rows = crate::compaction::multi_region::tuning().batch_rows;
+        let batch = plan.memory_limit
+            / (BUFFER_BUDGET_FACTOR * (plan.sources.len() + plan.targets.len() + batch_rows + 4));
         Ok(Self {
             batch,
+            batch_rows,
+            source_parallelism: crate::compaction::multi_region::tuning().source_parallelism,
             group: plan.memory_limit / 16,
             index: plan.memory_limit / (64 * plan.targets.len()),
             extension_index_memory_limit: None,
@@ -69,7 +75,7 @@ impl MemoryLimits {
                 // also have a nonzero minimum, independent of batch row count.
                 working_bytes: 2 * 1024 * 1024
                     + columns * 128 * 1024
-                    + batch * (MAX_ROW_GROUP_SIZE / BATCH_SIZE),
+                    + batch * MAX_ROW_GROUP_SIZE.div_ceil(batch_rows),
                 metadata_bytes: plan.memory_limit / (8 * plan.targets.len()),
             },
             estimated: 0,
@@ -91,9 +97,19 @@ impl MemoryLimits {
         self.writer.working_bytes = self.writer.working_bytes.saturating_add(extra_delta);
         // Merge assembly can retain exhausted batches until an output batch is full.
         let mut bytes = 4_u64
-            .saturating_mul((plan.sources.len() + BATCH_SIZE + 2) as u64)
+            .saturating_mul((plan.sources.len() + self.batch_rows + 2) as u64)
             .saturating_mul(self.batch as u64)
             .saturating_add(6 * self.group as u64);
+        // Prefetch retains one queued and one preparing batch per source in
+        // addition to the merge reader's current batches. The semaphore bounds
+        // CPU preparation, not the number of source queues.
+        if self.source_parallelism > 1 {
+            bytes = bytes.saturating_add(
+                2_u64
+                    .saturating_mul(plan.sources.len() as u64)
+                    .saturating_mul(self.batch as u64),
+            );
+        }
         for footer in footers {
             bytes = bytes.saturating_add(reader_bytes(footer));
         }
