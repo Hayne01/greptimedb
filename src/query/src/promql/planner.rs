@@ -2947,10 +2947,11 @@ impl PromPlanner {
                     // This is a hack to handle `.+` and `.*`, and is not strictly correct
                     // `.` doesn't match newline (`\n`). Given this is in PromQL context,
                     // most of the time it's fine.
-                    if re.as_str() == "^(?:.*)$" {
+                    let inner = Self::anchored_inner_pattern(re.as_str());
+                    if inner == Some(".*") {
                         continue;
                     }
-                    if re.as_str() == "^(?:.+)$" {
+                    if inner == Some(".+") {
                         col.not_eq(DfExpr::Literal(
                             ScalarValue::Utf8(Some(String::new())),
                             None,
@@ -2967,9 +2968,10 @@ impl PromPlanner {
                     }
                 }
                 MatchOp::NotRe(re) => {
-                    if re.as_str() == "^(?:.*)$" {
+                    let inner = Self::anchored_inner_pattern(re.as_str());
+                    if inner == Some(".*") {
                         DfExpr::Literal(ScalarValue::Boolean(Some(false)), None)
-                    } else if re.as_str() == "^(?:.+)$" {
+                    } else if inner == Some(".+") {
                         col.eq(DfExpr::Literal(
                             ScalarValue::Utf8(Some(String::new())),
                             None,
@@ -2994,6 +2996,57 @@ impl PromPlanner {
         }
 
         Ok(exprs)
+    }
+
+    /// Returns the bare pattern inside the parser's `^(?:...)$` anchor, with
+    /// redundant non-capturing groups that wrap the whole pattern peeled off.
+    ///
+    /// `promql-parser` anchors every regex matcher as `^(?:<pattern>)$`, so the
+    /// match-all spellings `.*` and `(?:.*)` arrive as `^(?:.*)$` and
+    /// `^(?:(?:.*))$`. A plain non-capturing group (no flags) is syntactically
+    /// transparent, so peeling it preserves the matching semantics — including
+    /// the `.`/newline caveat noted in [`Self::matchers_to_expr`]. Flagged groups
+    /// such as `(?s:.*)` are left alone because they can change what `.` matches.
+    ///
+    /// Returns `None` when the regex is not in the anchored form.
+    fn anchored_inner_pattern(regex: &str) -> Option<&str> {
+        let mut inner = regex.strip_prefix("^(?:")?.strip_suffix(")$")?;
+        while let Some(rest) = inner.strip_prefix("(?:") {
+            // Only peel a group that spans the whole remaining pattern.
+            match Self::matching_group_end(rest) {
+                Some(end) if end == rest.len() - 1 => inner = &rest[..end],
+                _ => break,
+            }
+        }
+        Some(inner)
+    }
+
+    /// Index of the `)` closing the group whose body is `body` (the text after
+    /// `(?:`), respecting escapes and character classes.
+    fn matching_group_end(body: &str) -> Option<usize> {
+        let mut depth = 1usize;
+        let mut escaped = false;
+        let mut in_class = false;
+        for (i, c) in body.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '[' if !in_class => in_class = true,
+                ']' if in_class => in_class = false,
+                '(' if !in_class => depth += 1,
+                ')' if !in_class => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn find_case_sensitive_column(schema: &DFSchemaRef, column: &str) -> Option<String> {
