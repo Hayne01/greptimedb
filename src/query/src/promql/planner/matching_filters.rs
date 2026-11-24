@@ -411,6 +411,9 @@ mod tests {
             assert_rewrite(query, expected);
         }
         assert!(rewrite(r#"a / b{host=~".*"}"#).is_none());
+        assert!(rewrite(r#"a / b{host=~"(?:.*)"}"#).is_none());
+        assert!(rewrite(r#"a / b{host=~"(?:(?:.*))"}"#).is_none());
+        assert!(rewrite(r#"a{host=~"(?:.*)"} / on(host) b"#).is_none());
     }
 
     #[test]
